@@ -2,11 +2,29 @@ package handler
 
 import (
 	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"strings"
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "<h1>Hello from Go!</h1>")
+	// --- 1. Security Check ---
+	cronSecret := os.Getenv("CRON_SECRET")
+	if cronSecret == "" {
+		log.Println("CRON_SECRET is not set. Aborting.")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	authHeader := r.Header.Get("authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") || strings.TrimPrefix(authHeader, "Bearer ") != cronSecret {
+		log.Println("Unauthorized access attempt.")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	result := fmt.Sprintf("Hello from Go! %s", authHeader)
+	fmt.Fprintf(w, "%s", result)
 }
 
 // import (
