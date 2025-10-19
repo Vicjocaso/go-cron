@@ -1,12 +1,19 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 )
+
+func EncodeOkReponse(w http.ResponseWriter, i interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(i)
+}
 
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// --- 1. Security Check ---
@@ -23,8 +30,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+
 	result := fmt.Sprintf("Hello from Go! %s", authHeader)
 	fmt.Fprintf(w, "%s", result)
+	EncodeOkReponse(w, result)
 }
 
 // import (
