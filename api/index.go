@@ -1,164 +1,314 @@
 package handler
 
 import (
+	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
+
+	"go-cron/config"
+	"go-cron/models"
+	"go-cron/utils"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func EncodeOkReponse(w http.ResponseWriter, i interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(i)
+// init function runs before main and is a great place to set up the DB connection.
+func init() {
+	utils.InitDB(config.LoadConfig())
+}
+
+// InsertItem inserts a new item into the database.
+func InsertItem(ctx context.Context, pool *pgxpool.Pool, title string) (int, error) {
+	// The SQL statement for insertion. Using RETURNING id is efficient
+	// as it returns the new item's ID without a second query.
+	sqlStatement := `
+		INSERT INTO products (title)
+		VALUES ($1)
+		RETURNING id`
+
+	var newID int
+	// pool.QueryRow is used for queries that are expected to return a single row.
+	//.Scan() then reads the returned 'id' into our newID variable.
+	err := pool.QueryRow(ctx, sqlStatement, title).Scan(&newID)
+	if err != nil {
+		// It's good practice to wrap errors for more context.
+		return 0, fmt.Errorf("unable to insert item: %w", err)
+	}
+
+	return newID, nil
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// --- 1. Security Check ---
-	cronSecret := os.Getenv("CRON_SECRET")
-	if cronSecret == "" {
-		log.Println("CRON_SECRET is not set. Aborting.")
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
+	config := config.LoadConfig()
 	authHeader := r.Header.Get("authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") || strings.TrimPrefix(authHeader, "Bearer ") != cronSecret {
+	if !strings.HasPrefix(authHeader, "Bearer ") || strings.TrimPrefix(authHeader, "Bearer ") != config.Auth.CRONSecret {
 		log.Println("Unauthorized access attempt.")
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	result := fmt.Sprintf("Hello from Go! %s", authHeader)
-	fmt.Fprintf(w, "%s", result)
-	EncodeOkReponse(w, result)
+	// Step 1: Login and get session
+	sessionID, err := login(config)
+	if err != nil {
+		fmt.Printf("Login failed: %v\n", err)
+		http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	fmt.Printf("Logged in with session: %s\n", sessionID)
+
+	// Step 2: Get the total count of items
+	count, err := getItemCount(config, sessionID)
+	if err != nil {
+		fmt.Printf("Failed to get item count: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Total count of items: %d\n", count)
+
+	// Step 3: Fetch all items by looping through pages in batches of 100
+	pageSize := 20
+	var allItems []map[string]interface{}
+	for skip := 0; skip < count; skip += pageSize {
+		pageItems, err := fetchItemsPage(config, sessionID, pageSize, skip)
+		if err != nil {
+			fmt.Printf("Failed to fetch page at skip %d: %v\n", skip, err)
+			os.Exit(1)
+		}
+
+		if len(pageItems) == 0 {
+			break
+		}
+
+		allItems = append(allItems, pageItems...)
+
+		// Ensure the connection pool is closed when the application exits.
+		// defer utils.DB.Close()
+
+		// fmt.Println("Attempting to insert a new item...")
+		// fmt.Println(pageItems[0]["ItemName"].(string))
+
+		// insertedID, err := InsertItem(utils.DB, pageItems[0]["ItemName"].(string))
+		// if err != nil {
+		// 	log.Fatalf("Error inserting item: %v", err)
+		// }
+		// fmt.Println(insertedID)
+		fmt.Printf("Fetched %d items (skip=%d)\n", len(pageItems), skip)
+	}
+
+	err = logout(config.ExternalAPI.ExternalAPIURL, sessionID)
+	if err != nil {
+		fmt.Printf("Logout failed: %v\n", err)
+		http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	fmt.Printf("Logged out successfully\n")
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":      "Success Fetching Data from SAP",
+		"totalItems":   strconv.Itoa(count),
+		"itemsFetched": allItems,
+	})
 }
 
-// import (
-// 	"context"
-// 	"database/sql"
-// 	"encoding/json"
-// 	"fmt"
-// 	"io"
-// 	"log"
-// 	"net/http"
-// 	"os"
-// 	"strings"
-// 	"time"
-// 	// _ "github.com/jackc/pgx/v5/stdlib"
-// )
+func getItemCount(config *models.AppConfig, sessionID string) (int, error) {
+	baseURL := config.ExternalAPI.ExternalAPIURL
+	u, err := url.Parse(baseURL + config.ExternalAPI.ItemsURL + "/$count?")
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse base URL: %v", err)
+	}
 
-// // DataPayload defines the structure of the data expected from the external API.
-// // This should be customized to match the actual JSON response.
-// type DataPayload struct {
-// 	ID   int    `json:"id"`
-// 	Name string `json:"name"`
-// 	Data string `json:"data"`
-// }
+	params := url.Values{}
+	params.Add("$select", "ItemCode,ItemName,ItemsGroupCode")
+	params.Add("$filter", "ItemsGroupCode eq 100 or ItemsGroupCode eq 101 or ItemsGroupCode eq 121")
+	params.Add("$orderby", "ItemCode")
 
-// // Global DB handle for connection pooling
-// var db *sql.DB
+	u.RawQuery = params.Encode()
 
-// func init() {
-// 	var err error
-// 	dbURL := os.Getenv("DATABASE_URL")
-// 	if dbURL == "" {
-// 		log.Fatal("DATABASE_URL environment variable is not set")
-// 	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return 0, err
+	}
+	jar.SetCookies(u, []*http.Cookie{{Name: "B1SESSION", Value: sessionID}})
 
-// 	// The pgx driver is registered with the name "pgx".
-// 	db, err = sql.Open("pgx", dbURL)
-// 	if err != nil {
-// 		log.Fatalf("Unable to connect to database: %v\n", err)
-// 	}
+	client := &http.Client{
+		Jar: jar,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 
-// 	// Configure connection pool settings.
-// 	db.SetMaxOpenConns(5)
-// 	db.SetMaxIdleConns(5)
-// 	db.SetConnMaxLifetime(5 * time.Minute)
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Accept", "text/plain")
 
-// 	// Ping the database to verify the connection.
-// 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 	defer cancel()
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
 
-// 	err = db.PingContext(ctx)
-// 	if err != nil {
-// 		log.Fatalf("Database ping failed: %v\n", err)
-// 	}
-// 	log.Println("Database connection pool established successfully.")
-// }
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("count fetch failed with status %d: %s", resp.StatusCode, string(body))
+	}
 
-// // Handler is the main entry point for the Vercel Serverless Function.
-// func Handler(w http.ResponseWriter, r *http.Request) {
-// 	// --- 1. Security Check ---
-// 	cronSecret := os.Getenv("CRON_SECRET")
-// 	if cronSecret == "" {
-// 		log.Println("CRON_SECRET is not set. Aborting.")
-// 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-// 		return
-// 	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
 
-// 	authHeader := r.Header.Get("authorization")
-// 	if !strings.HasPrefix(authHeader, "Bearer ") || strings.TrimPrefix(authHeader, "Bearer ") != cronSecret {
-// 		log.Println("Unauthorized access attempt.")
-// 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-// 		return
-// 	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(body)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse count: %v", err)
+	}
 
-// 	// --- 2. Data Extraction ---
-// 	dataSourceURL := os.Getenv("DATA_SOURCE_URL")
-// 	if dataSourceURL == "" {
-// 		log.Println("DATA_SOURCE_URL is not set. Aborting.")
-// 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-// 		return
-// 	}
+	return count, nil
+}
 
-// 	client := http.Client{Timeout: 30 * time.Second}
-// 	resp, err := client.Get(dataSourceURL)
-// 	if err != nil {
-// 		log.Printf("Error fetching data from source: %v", err)
-// 		http.Error(w, "Failed to fetch data", http.StatusInternalServerError)
-// 		return
-// 	}
-// 	defer resp.Body.Close()
+func login(config *models.AppConfig) (string, error) {
+	loginURL := config.ExternalAPI.ExternalAPIURL + config.ExternalAPI.LoginURL
+	reqBody := models.Credentials{
+		CompanyDB: config.ExternalAuth.CompanyDB,
+		UserName:  config.ExternalAuth.UserName,
+		Password:  config.ExternalAuth.Password,
+	}
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
 
-// 	if resp.StatusCode != http.StatusOK {
-// 		log.Printf("External API returned non-200 status: %d", resp.StatusCode)
-// 		http.Error(w, "External API error", http.StatusBadGateway)
-// 		return
-// 	}
+	req, err := http.NewRequest("POST", loginURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-// 	body, err := io.ReadAll(resp.Body)
-// 	if err != nil {
-// 		log.Printf("Error reading response body: %v", err)
-// 		http.Error(w, "Failed to read response", http.StatusInternalServerError)
-// 		return
-// 	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 
-// 	var payload DataPayload
-// 	if err := json.Unmarshal(body, &payload); err != nil {
-// 		log.Printf("Error unmarshaling JSON: %v", err)
-// 		http.Error(w, "Invalid data format from source", http.StatusInternalServerError)
-// 		return
-// 	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
 
-// 	// --- 3. Data Loading ---
-// 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-// 	defer cancel()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("login failed with status %d: %s", resp.StatusCode, string(body))
+	}
 
-// 	// Use a parameterized query to prevent SQL injection.
-// 	sqlStatement := `INSERT INTO your_table (id, name, data) VALUES ($1, $2, $3)`
-// 	_, err = db.ExecContext(ctx, sqlStatement, payload.ID, payload.Name, payload.Data)
-// 	if err != nil {
-// 		log.Printf("Error inserting data into database: %v", err)
-// 		http.Error(w, "Database insertion failed", http.StatusInternalServerError)
-// 		return
-// 	}
+	var loginResp models.LoginResponse
+	err = json.NewDecoder(resp.Body).Decode(&loginResp)
+	if err != nil {
+		return "", err
+	}
 
-// 	// --- Success ---
-// 	log.Println("Data processed and stored successfully.")
-// 	w.WriteHeader(http.StatusOK)
-// 	fmt.Fprintln(w, "Data processed successfully.")
-// }
+	return loginResp.SessionID, nil
+}
+
+func fetchItemsPage(config *models.AppConfig, sessionID string, top, skip int) ([]map[string]interface{}, error) {
+	u, err := url.Parse(config.ExternalAPI.ExternalAPIURL + config.ExternalAPI.ItemsURL + "?")
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse base URL: %v", err)
+	}
+
+	params := url.Values{}
+	params.Add("$select", "ItemCode,ItemName,ItemsGroupCode")
+	params.Add("$filter", "ItemsGroupCode eq 100 or ItemsGroupCode eq 101 or ItemsGroupCode eq 121")
+	params.Add("$orderby", "ItemCode")
+	params.Add("$top", strconv.Itoa(top))
+	params.Add("$skip", strconv.Itoa(skip))
+
+	u.RawQuery = params.Encode()
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	jar.SetCookies(u, []*http.Cookie{{Name: "B1SESSION", Value: sessionID}})
+
+	client := &http.Client{
+		Jar: jar,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("fetch failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var itemsResp models.ItemsResponse
+	err = json.NewDecoder(resp.Body).Decode(&itemsResp)
+	if err != nil {
+		return nil, err
+	}
+
+	return itemsResp.Value, nil
+}
+
+func logout(baseURL, sessionID string) error {
+	logoutURL := baseURL + "/Logout"
+
+	req, err := http.NewRequest("POST", logoutURL, nil)
+	if err != nil {
+		return err
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return err
+	}
+	u, _ := url.Parse(baseURL)
+	jar.SetCookies(u, []*http.Cookie{{Name: "B1SESSION", Value: sessionID}})
+
+	client := &http.Client{
+		Jar: jar,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("logout failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
