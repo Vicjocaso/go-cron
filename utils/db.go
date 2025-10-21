@@ -6,6 +6,8 @@ import (
 	"go-cron/models"
 	"log"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // Global DB handle for connection pooling
@@ -14,7 +16,7 @@ var db *sql.DB
 func InitDB(config *models.AppConfig) {
 	var err error
 	// The pgx driver is registered with the name "pgx".
-	db, err = sql.Open("pgx", config.Database.DatabaseURI)
+	db, err = sql.Open("postgres", config.Database.DatabaseURI)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
 	}
