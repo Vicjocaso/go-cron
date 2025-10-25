@@ -13,12 +13,22 @@ import (
 // Global DB handle for connection pooling
 var db *sql.DB
 
+// GetDB returns the database connection instance
+func GetDB() *sql.DB {
+	return db
+}
+
 func InitDB(config *models.AppConfig) {
 	var err error
 	// The pgx driver is registered with the name "pgx".
 	db, err = sql.Open("postgres", config.Database.DatabaseURI)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		log.Fatalf("Unable to ping database: %v\n", err)
 	}
 
 	// Configure connection pool settings.

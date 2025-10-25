@@ -11,15 +11,15 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"go-cron/config"
 	"go-cron/models"
+	"go-cron/repo"
 	"go-cron/utils"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // init function runs before main and is a great place to set up the DB connection.
@@ -27,28 +27,26 @@ func init() {
 	utils.InitDB(config.LoadConfig())
 }
 
-// InsertItem inserts a new item into the database.
-func InsertItem(ctx context.Context, pool *pgxpool.Pool, title string) (int, error) {
-	// The SQL statement for insertion. Using RETURNING id is efficient
-	// as it returns the new item's ID without a second query.
-	sqlStatement := `
-		INSERT INTO products (title)
-		VALUES ($1)
-		RETURNING id`
+// PageJob represents a page fetching job
+type PageJob struct {
+	Skip int
+	Top  int
+}
 
-	var newID int
-	// pool.QueryRow is used for queries that are expected to return a single row.
-	//.Scan() then reads the returned 'id' into our newID variable.
-	err := pool.QueryRow(ctx, sqlStatement, title).Scan(&newID)
-	if err != nil {
-		// It's good practice to wrap errors for more context.
-		return 0, fmt.Errorf("unable to insert item: %w", err)
-	}
-
-	return newID, nil
+// PageResult represents the result of fetching a page
+type PageResult struct {
+	Items []map[string]interface{}
+	Skip  int
+	Err   error
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
 	// --- 1. Security Check ---
 	config := config.LoadConfig()
 	authHeader := r.Header.Get("authorization")
@@ -58,68 +56,171 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Initialize repository and sync service
+	db := utils.GetDB()
+	productRepo := repo.NewProductRepository(db)
+	syncService := repo.NewSyncService(productRepo)
+
 	// Step 1: Login and get session
+	log.Println("Logging in to external API...")
 	sessionID, err := login(config)
 	if err != nil {
-		fmt.Printf("Login failed: %v\n", err)
-		http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
+		log.Printf("Login failed: %v\n", err)
+		http.Error(w, fmt.Sprintf("Login failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-	fmt.Printf("Logged in with session: %s\n", sessionID)
+	log.Printf("Logged in successfully with session: %s\n", sessionID)
+
+	// Ensure logout happens at the end
+	defer func() {
+		if err := logout(config.ExternalAPI.ExternalAPIURL, sessionID); err != nil {
+			log.Printf("Logout failed: %v\n", err)
+		} else {
+			log.Println("Logged out successfully")
+		}
+	}()
 
 	// Step 2: Get the total count of items
+	log.Println("Fetching item count from external API...")
 	count, err := getItemCount(config, sessionID)
 	if err != nil {
-		fmt.Printf("Failed to get item count: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Total count of items: %d\n", count)
-
-	// Step 3: Fetch all items by looping through pages in batches of 100
-	pageSize := 20
-	var allItems []map[string]interface{}
-	for skip := 0; skip < count; skip += pageSize {
-		pageItems, err := fetchItemsPage(config, sessionID, pageSize, skip)
-		if err != nil {
-			fmt.Printf("Failed to fetch page at skip %d: %v\n", skip, err)
-			os.Exit(1)
-		}
-
-		if len(pageItems) == 0 {
-			break
-		}
-
-		allItems = append(allItems, pageItems...)
-
-		// Ensure the connection pool is closed when the application exits.
-		// defer utils.DB.Close()
-
-		// fmt.Println("Attempting to insert a new item...")
-		// fmt.Println(pageItems[0]["ItemName"].(string))
-
-		// insertedID, err := InsertItem(utils.DB, pageItems[0]["ItemName"].(string))
-		// if err != nil {
-		// 	log.Fatalf("Error inserting item: %v", err)
-		// }
-		// fmt.Println(insertedID)
-		fmt.Printf("Fetched %d items (skip=%d)\n", len(pageItems), skip)
-	}
-
-	err = logout(config.ExternalAPI.ExternalAPIURL, sessionID)
-	if err != nil {
-		fmt.Printf("Logout failed: %v\n", err)
-		http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
+		log.Printf("Failed to get item count: %v\n", err)
+		http.Error(w, fmt.Sprintf("Failed to get item count: %v", err), http.StatusInternalServerError)
 		return
 	}
-	fmt.Printf("Logged out successfully\n")
+	log.Printf("Total count of items: %d\n", count)
 
+	// Step 3: Fetch all items concurrently using worker pool
+	pageSize := 20
+	numWorkers := 2 // Number of concurrent workers
+
+	log.Printf("Starting concurrent fetch with %d workers...\n", numWorkers)
+	allItems, err := fetchAllItemsConcurrently(ctx, config, sessionID, count, pageSize, numWorkers)
+	if err != nil {
+		log.Printf("Failed to fetch items: %v\n", err)
+		http.Error(w, fmt.Sprintf("Failed to fetch items: %v", err), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Successfully fetched %d items from external API\n", len(allItems))
+
+	// Step 4: Sync with database
+	log.Println("Starting database synchronization...")
+	syncResult, err := syncService.CompareAndSync(ctx, allItems)
+	if err != nil {
+		log.Printf("Sync failed: %v\n", err)
+		http.Error(w, fmt.Sprintf("Sync failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	duration := time.Since(startTime)
+	log.Printf("Sync completed in %v - Created: %d, Updated: %d, Unchanged: %d\n",
+		duration, syncResult.Created, syncResult.Updated, syncResult.Unchanged)
+
+	// Return response
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":      "Success Fetching Data from SAP",
-		"totalItems":   strconv.Itoa(count),
-		"itemsFetched": allItems,
+		"message":      "Successfully synchronized data from external API",
+		"totalItems":   count,
+		"itemsFetched": len(allItems),
+		"syncResult":   syncResult,
+		"duration":     duration.String(),
 	})
+}
+
+// fetchAllItemsConcurrently fetches all items from external API using a worker pool pattern
+func fetchAllItemsConcurrently(ctx context.Context, config *models.AppConfig, sessionID string, totalCount, pageSize, numWorkers int) ([]map[string]interface{}, error) {
+	// Create job channel and result channel
+	jobs := make(chan PageJob, numWorkers*2)
+	results := make(chan PageResult, numWorkers*2)
+
+	// Start worker pool
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			worker(ctx, workerID, config, sessionID, pageSize, jobs, results)
+		}(i)
+	}
+
+	// Send jobs to workers
+	go func() {
+		for skip := 0; skip < totalCount; skip += pageSize {
+			select {
+			case jobs <- PageJob{Skip: skip, Top: pageSize}:
+			case <-ctx.Done():
+				close(jobs)
+				return
+			}
+		}
+		close(jobs)
+	}()
+
+	// Collect results in a separate goroutine
+	allResults := make([]PageResult, 0)
+	var resultWg sync.WaitGroup
+	resultWg.Add(1)
+	go func() {
+		defer resultWg.Done()
+		for result := range results {
+			allResults = append(allResults, result)
+		}
+	}()
+
+	// Wait for all workers to finish
+	wg.Wait()
+	close(results)
+
+	// Wait for result collection to finish
+	resultWg.Wait()
+
+	// Check for errors and combine all items
+	var allItems []map[string]interface{}
+	for _, result := range allResults {
+		if result.Err != nil {
+			return nil, fmt.Errorf("error fetching page at skip %d: %w", result.Skip, result.Err)
+		}
+		allItems = append(allItems, result.Items...)
+	}
+
+	return allItems, nil
+}
+
+// worker is a worker goroutine that fetches pages from the external API
+func worker(ctx context.Context, workerID int, config *models.AppConfig, sessionID string, pageSize int, jobs <-chan PageJob, results chan<- PageResult) {
+	log.Printf("Worker %d started\n", workerID)
+
+	for job := range jobs {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %d cancelled\n", workerID)
+			return
+		default:
+			log.Printf("Worker %d fetching page at skip=%d\n", workerID, job.Skip)
+			items, err := fetchItemsPage(config, sessionID, job.Top, job.Skip)
+
+			result := PageResult{
+				Items: items,
+				Skip:  job.Skip,
+				Err:   err,
+			}
+
+			select {
+			case results <- result:
+				if err == nil {
+					log.Printf("Worker %d completed page at skip=%d (%d items)\n", workerID, job.Skip, len(items))
+				} else {
+					log.Printf("Worker %d error at skip=%d: %v\n", workerID, job.Skip, err)
+				}
+			case <-ctx.Done():
+				log.Printf("Worker %d cancelled while sending result\n", workerID)
+				return
+			}
+		}
+	}
+
+	log.Printf("Worker %d finished\n", workerID)
 }
 
 func getItemCount(config *models.AppConfig, sessionID string) (int, error) {
